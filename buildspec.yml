@@ -2,53 +2,56 @@ version: 0.2
 
 env:
   variables:
-    # App settings
+    # --- App settings ---
     PORT: "3000"
-    APP_START_CMD: "npm start"
+    APP_START_CMD: "npm start"              # e.g., "node app.js" if that's your entrypoint
     APP_HEALTH_URL: "http://127.0.0.1:3000/"
 
-    # Snyk settings
-    SNYK_SEVERITY_THRESHOLD: "high"   # low|medium|high|critical
-    SNYK_ENFORCE: "false"             # "true" to fail build on Snyk findings
+    # --- Snyk settings ---
+    SNYK_SEVERITY_THRESHOLD: "high"         # low|medium|high|critical
+    SNYK_ENFORCE: "false"                   # "true" to fail build on threshold findings
 
-    # ZAP settings
-    ZAP_FAIL_LEVEL: "1"               # 0=pass, 1=fail on Medium+, etc (zap-baseline -m)
-    ZAP_ENFORCE: "true"               # "true" to fail build if ZAP exit code non-zero
+    # --- OWASP ZAP settings ---
+    ZAP_FAIL_LEVEL: "1"                     # zap-baseline -m <level>; 1 ≈ fail on Medium+
+    ZAP_ENFORCE: "true"                     # "true" to fail build if ZAP non-zero exit
     ZAP_IMAGE: "ghcr.io/zaproxy/zaproxy:stable"
 
 phases:
   install:
     runtime-versions:
       nodejs: 20
-      docker: 20
     commands:
-      - echo "==> Installing base tools (curl, jq) with the available package manager"
+      - echo "==> Verifying Docker is available (image + privileged mode)"
+      - docker --version || { echo "Docker not found. Use a standard image and enable Privileged mode in CodeBuild."; exit 1; }
+
+      - echo "==> Ensuring curl/jq exist (best-effort)"
       - |
         set -e
         PM=""
         command -v dnf >/dev/null 2>&1 && PM="dnf"
         command -v yum >/dev/null 2>&1 && PM="${PM:-yum}"
         command -v apt-get >/dev/null 2>&1 && PM="${PM:-apt-get}"
-        echo "Using package manager: ${PM}"
         if [ -n "$PM" ]; then
           if [ "$PM" = "dnf" ]; then
-            $PM -y install curl jq || $PM -y update && $PM -y install curl jq
+            $PM -y install curl jq || { $PM -y update; $PM -y install curl jq; }
           elif [ "$PM" = "yum" ]; then
             $PM -y install curl jq || { $PM -y update; $PM -y install curl jq; }
           else
             $PM update -y || true
-            $PM install -y curl jq
+            $PM install -y curl jq || true
           fi
         else
-          echo "No known package manager found; assuming curl/jq are present."
+          echo "No known package manager; assuming curl/jq already available."
         fi
 
   pre_build:
     commands:
-      - echo "==> Installing Node dependencies"
+      - echo "==> Installing node dependencies"
       - npm ci || npm install
-      - echo "==> Starting app in background"
+
+      - echo "==> Starting app in background: $APP_START_CMD"
       - nohup sh -c "$APP_START_CMD" >/tmp/app.log 2>&1 &
+
       - echo "==> Waiting for app to be healthy at $APP_HEALTH_URL"
       - |
         for i in $(seq 1 60); do
@@ -65,12 +68,13 @@ phases:
     commands:
       - set -euo pipefail
 
-      # -------- SNYK SCA/SAST --------
+      # ---------- SNYK SCA/SAST ----------
       - echo "==> Installing Snyk CLI"
       - curl -sSL -o /usr/local/bin/snyk https://github.com/snyk/cli/releases/latest/download/snyk-linux
       - chmod +x /usr/local/bin/snyk
+
       - echo "==> Authenticating Snyk CLI"
-      - snyk auth "$SNYK_TOKEN"
+      - snyk auth "$SNYK_TOKEN"    # Provide SNYK_TOKEN via Secrets Manager/Parameter Store in CodeBuild
 
       - echo "==> Running Snyk test (threshold=$SNYK_SEVERITY_THRESHOLD, enforce=$SNYK_ENFORCE)"
       - |
@@ -85,13 +89,11 @@ phases:
           echo "Snyk exit code: $SNYK_EXIT (enforce=$SNYK_ENFORCE)"
         fi
 
-      # -------- OWASP ZAP DAST (Baseline) --------
+      # ---------- OWASP ZAP DAST (Baseline) ----------
       - echo "==> Running OWASP ZAP Baseline scan against $APP_HEALTH_URL"
       - |
-        # Prefer host networking so ZAP can reach the app at 127.0.0.1
-        # Requires Privileged mode. If host networking isn't available, you can switch to:
-        #   docker run --add-host host.docker.internal:host-gateway ... -t http://host.docker.internal:${PORT}/
         set +e
+        # Try host networking first (best for localhost targets)
         docker run --rm --network host \
           -v "$PWD":/zap/wrk/:rw \
           "$ZAP_IMAGE" \
@@ -102,7 +104,24 @@ phases:
             -x zap_report.xml \
             -m "$ZAP_FAIL_LEVEL"
         ZAP_EXIT=$?
+
+        # If the first attempt fails (e.g., host networking not supported), retry via host.docker.internal
+        if [ $ZAP_EXIT -ne 0 ]; then
+          echo "ZAP first attempt exit code: $ZAP_EXIT. Retrying using host.docker.internal..."
+          docker run --rm \
+            --add-host host.docker.internal:host-gateway \
+            -v "$PWD":/zap/wrk/:rw \
+            "$ZAP_IMAGE" \
+            zap-baseline.py \
+              -t "http://host.docker.internal:${PORT}/" \
+              -r zap_report.html \
+              -w zap_warnings.md \
+              -x zap_report.xml \
+              -m "$ZAP_FAIL_LEVEL"
+          ZAP_EXIT=$?
+        fi
         set -e
+
         echo "ZAP exit code: $ZAP_EXIT (enforce=$ZAP_ENFORCE)"
         if [ "$ZAP_ENFORCE" = "true" ] && [ $ZAP_EXIT -ne 0 ]; then
           echo "ZAP reported findings over the configured threshold; failing build."
