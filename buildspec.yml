@@ -2,9 +2,11 @@ version: 0.2
 
 env:
   variables:
+    # Adjust these if needed
     PORT: "3000"
     APP_START_CMD: "npm start"
-    APP_HEALTH_URL: "http://127.0.0.1:3000/"
+    # Comma-separated list of ports to probe if 3000 fails
+    FALLBACK_PORTS: "3000,8080,8000,5000,4200"
     SNYK_SEVERITY_THRESHOLD: "high"
     SNYK_ENFORCE: "false"
     ZAP_FAIL_LEVEL: "1"
@@ -21,15 +23,22 @@ phases:
 
   pre_build:
     commands:
+      - "echo Exporting PORT=$PORT"
+      - "export PORT=$PORT"
       - "echo Installing node dependencies"
       - "npm ci || npm install"
-      - "echo Starting app"
+      - "echo Starting app: $APP_START_CMD"
       - "nohup sh -c \"$APP_START_CMD\" >/tmp/app.log 2>&1 &"
-      - "echo Waiting for app to be healthy"
-      - "bash -lc 'for i in {1..60}; do if curl -fsS \"$APP_HEALTH_URL\" >/dev/null 2>&1; then echo App is up; exit 0; fi; echo Waiting... $i/60; sleep 2; done; echo App did not become healthy; exit 1'"
+      - "echo Probing for a healthy endpoint"
+      - "bash -lc 'set -e; TARGET=\"\"; IFS=\",\" read -ra PORTS <<< \"$FALLBACK_PORTS\"; for p in \"${PORTS[@]}\"; do for i in {1..45}; do if curl -fsS \"http://127.0.0.1:${p}/\" >/dev/null 2>&1; then TARGET=\"http://127.0.0.1:${p}/\"; break; fi; sleep 2; done; [ -n \"$TARGET\" ] && break; done; if [ -z \"$TARGET\" ]; then echo \"App did not become healthy on any of $FALLBACK_PORTS\"; echo \"--- /tmp/app.log ---\"; tail -n 200 /tmp/app.log || true; echo \"--- listening sockets (netstat) ---\"; (netstat -tulpn 2>/dev/null || ss -tulpn 2>/dev/null || true); exit 1; else echo \"Detected healthy target: $TARGET\"; echo \"$TARGET\" > /tmp/target_url.txt; fi'"
 
   build:
     commands:
+      - "set -e"
+      - "TARGET_URL=$(cat /tmp/target_url.txt)"
+      - "echo Using TARGET_URL=$TARGET_URL"
+
+      # ---- SNYK ----
       - "echo Installing Snyk CLI"
       - "curl -sSL -o /usr/local/bin/snyk https://github.com/snyk/cli/releases/latest/download/snyk-linux"
       - "chmod +x /usr/local/bin/snyk"
@@ -37,8 +46,10 @@ phases:
       - "snyk auth \"$SNYK_TOKEN\""
       - "echo Running Snyk test"
       - "bash -lc 'snyk test --severity-threshold=\"$SNYK_SEVERITY_THRESHOLD\" --json-file-output=snyk_report.json; SNYK_EXIT=$?; if [ \"$SNYK_ENFORCE\" = true ] && [ $SNYK_EXIT -ne 0 ]; then echo Snyk failing build exit $SNYK_EXIT; exit $SNYK_EXIT; else echo Snyk exit $SNYK_EXIT; fi'"
-      - "echo Running OWASP ZAP baseline scan"
-      - "bash -lc 'docker run --rm --network host -v \"$PWD\":/zap/wrk/ \"$ZAP_IMAGE\" zap-baseline.py -t \"$APP_HEALTH_URL\" -r zap_report.html -w zap_warnings.md -x zap_report.xml -m \"$ZAP_FAIL_LEVEL\"; ZAP_EXIT=$?; if [ $ZAP_EXIT -ne 0 ]; then echo Retry ZAP via host.docker.internal; docker run --rm --add-host host.docker.internal:host-gateway -v \"$PWD\":/zap/wrk/ \"$ZAP_IMAGE\" zap-baseline.py -t \"http://host.docker.internal:${PORT}/\" -r zap_report.html -w zap_warnings.md -x zap_report.xml -m \"$ZAP_FAIL_LEVEL\"; ZAP_EXIT=$?; fi; if [ \"$ZAP_ENFORCE\" = true ] && [ $ZAP_EXIT -ne 0 ]; then echo ZAP failing build exit $ZAP_EXIT; exit $ZAP_EXIT; else echo ZAP exit $ZAP_EXIT; fi'"
+
+      # ---- OWASP ZAP ----
+      - "echo Running OWASP ZAP baseline scan against $TARGET_URL"
+      - "bash -lc 'docker run --rm --network host -v \"$PWD\":/zap/wrk/ \"$ZAP_IMAGE\" zap-baseline.py -t \"$TARGET_URL\" -r zap_report.html -w zap_warnings.md -x zap_report.xml -m \"$ZAP_FAIL_LEVEL\"; ZAP_EXIT=$?; if [ $ZAP_EXIT -ne 0 ]; then echo Retry ZAP via host.docker.internal; docker run --rm --add-host host.docker.internal:host-gateway -v \"$PWD\":/zap/wrk/ \"$ZAP_IMAGE\" zap-baseline.py -t \"${TARGET_URL/127.0.0.1/host.docker.internal}\" -r zap_report.html -w zap_warnings.md -x zap_report.xml -m \"$ZAP_FAIL_LEVEL\"; ZAP_EXIT=$?; fi; if [ \"$ZAP_ENFORCE\" = true ] && [ $ZAP_EXIT -ne 0 ]; then echo ZAP failing build exit $ZAP_EXIT; exit $ZAP_EXIT; else echo ZAP exit $ZAP_EXIT; fi'"
 
 artifacts:
   files:
@@ -47,4 +58,5 @@ artifacts:
     - zap_warnings.md
     - zap_report.xml
     - /tmp/app.log
+    - /tmp/target_url.txt
   discard-paths: yes
