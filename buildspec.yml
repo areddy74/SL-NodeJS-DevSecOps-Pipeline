@@ -16,31 +16,29 @@ phases:
     runtime-versions:
       nodejs: 20
     commands:
-      - "echo '==> Verifying Docker is available (enable Privileged mode and use a standard image, e.g., aws/codebuild/standard:7.0)'"
-      - "docker --version || { echo 'Docker not found'; exit 1; }"
-      - "echo '==> Ensuring curl/jq exist (best-effort)'"
-      - "bash -lc 'set -e; PM=\"\"; command -v dnf >/dev/null 2>&1 && PM=dnf; command -v yum >/dev/null 2>&1 && PM=${PM:-yum}; command -v apt-get >/dev/null 2>&1 && PM=${PM:-apt-get}; echo Using-PM=${PM:-none}; if [ -n \"$PM\" ] && [ \"$PM\" = dnf ]; then dnf -y install curl jq || { dnf -y update; dnf -y install curl jq; }; elif [ -n \"$PM\" ] && [ \"$PM\" = yum ]; then yum -y install curl jq || { yum -y update; yum -y install curl jq; }; elif [ -n \"$PM\" ] && [ \"$PM\" = apt-get ]; then apt-get update -y || true; apt-get install -y curl jq || true; else echo Skipping-package-install; fi'"
+      - "echo Checking Docker availability"
+      - "docker --version || { echo Docker not found; exit 1; }"
 
   pre_build:
     commands:
-      - "echo '==> Installing node dependencies'"
+      - "echo Installing node dependencies"
       - "npm ci || npm install"
-      - \"echo '==> Starting app:' $APP_START_CMD\"
+      - "echo Starting app"
       - "nohup sh -c \"$APP_START_CMD\" >/tmp/app.log 2>&1 &"
-      - "echo '==> Waiting for app to be healthy at' $APP_HEALTH_URL"
-      - "bash -lc 'for i in {1..60}; do if curl -fsS \"$APP_HEALTH_URL\" >/dev/null 2>&1; then echo App-is-up.; exit 0; fi; echo Waiting-for-app...-\\($i/60\\); sleep 2; done; echo App-did-not-become-healthy-in-time; exit 1'"
+      - "echo Waiting for app to be healthy"
+      - "bash -lc 'for i in {1..60}; do if curl -fsS \"$APP_HEALTH_URL\" >/dev/null 2>&1; then echo App is up; exit 0; fi; echo Waiting... $i/60; sleep 2; done; echo App did not become healthy; exit 1'"
 
   build:
     commands:
-      - "echo '==> Installing Snyk CLI'"
+      - "echo Installing Snyk CLI"
       - "curl -sSL -o /usr/local/bin/snyk https://github.com/snyk/cli/releases/latest/download/snyk-linux"
       - "chmod +x /usr/local/bin/snyk"
-      - \"echo '==> Authenticating Snyk CLI (SNYK_TOKEN must be provided via Parameter Store/Secrets Manager)'\"
+      - "echo Authenticating Snyk CLI"
       - "snyk auth \"$SNYK_TOKEN\""
-      - \"echo '==> Running Snyk test (threshold=' $SNYK_SEVERITY_THRESHOLD ', enforce=' $SNYK_ENFORCE ')'\"
-      - "bash -lc 'snyk test --severity-threshold=\"$SNYK_SEVERITY_THRESHOLD\" --json-file-output=snyk_report.json; SNYK_EXIT=$?; if [ \"$SNYK_ENFORCE\" = true ] && [ $SNYK_EXIT -ne 0 ]; then echo Failing-build-due-to-Snyk-findings-exit=$SNYK_EXIT; exit $SNYK_EXIT; else echo Snyk-exit=$SNYK_EXIT-enforce=$SNYK_ENFORCE; fi'"
-      - "echo '==> Running OWASP ZAP Baseline scan against' $APP_HEALTH_URL"
-      - "bash -lc 'docker run --rm --network host -v \"$PWD\":/zap/wrk/:rw \"$ZAP_IMAGE\" zap-baseline.py -t \"$APP_HEALTH_URL\" -r zap_report.html -w zap_warnings.md -x zap_report.xml -m \"$ZAP_FAIL_LEVEL\"; ZAP_EXIT=$?; if [ $ZAP_EXIT -ne 0 ]; then echo ZAP-first-attempt-exit=$ZAP_EXIT-retrying-via-host.docker.internal...; docker run --rm --add-host host.docker.internal:host-gateway -v \"$PWD\":/zap/wrk/:rw \"$ZAP_IMAGE\" zap-baseline.py -t \"http://host.docker.internal:${PORT}/\" -r zap_report.html -w zap_warnings.md -x zap_report.xml -m \"$ZAP_FAIL_LEVEL\"; ZAP_EXIT=$?; fi; if [ \"$ZAP_ENFORCE\" = true ] && [ $ZAP_EXIT -ne 0 ]; then echo Failing-build-due-to-ZAP-findings-exit=$ZAP_EXIT; exit $ZAP_EXIT; else echo ZAP-exit=$ZAP_EXIT-enforce=$ZAP_ENFORCE; fi'"
+      - "echo Running Snyk test"
+      - "bash -lc 'snyk test --severity-threshold=\"$SNYK_SEVERITY_THRESHOLD\" --json-file-output=snyk_report.json; SNYK_EXIT=$?; if [ \"$SNYK_ENFORCE\" = true ] && [ $SNYK_EXIT -ne 0 ]; then echo Snyk failing build exit $SNYK_EXIT; exit $SNYK_EXIT; else echo Snyk exit $SNYK_EXIT; fi'"
+      - "echo Running OWASP ZAP baseline scan"
+      - "bash -lc 'docker run --rm --network host -v \"$PWD\":/zap/wrk/ \"$ZAP_IMAGE\" zap-baseline.py -t \"$APP_HEALTH_URL\" -r zap_report.html -w zap_warnings.md -x zap_report.xml -m \"$ZAP_FAIL_LEVEL\"; ZAP_EXIT=$?; if [ $ZAP_EXIT -ne 0 ]; then echo Retry ZAP via host.docker.internal; docker run --rm --add-host host.docker.internal:host-gateway -v \"$PWD\":/zap/wrk/ \"$ZAP_IMAGE\" zap-baseline.py -t \"http://host.docker.internal:${PORT}/\" -r zap_report.html -w zap_warnings.md -x zap_report.xml -m \"$ZAP_FAIL_LEVEL\"; ZAP_EXIT=$?; fi; if [ \"$ZAP_ENFORCE\" = true ] && [ $ZAP_EXIT -ne 0 ]; then echo ZAP failing build exit $ZAP_EXIT; exit $ZAP_EXIT; else echo ZAP exit $ZAP_EXIT; fi'"
 
 artifacts:
   files:
