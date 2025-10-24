@@ -1,0 +1,96 @@
+version: 0.2
+
+env:
+  variables:
+    # App settings
+    PORT: "3000"
+    APP_START_CMD: "npm start"        # change if you start differently, e.g., "node app.js"
+    APP_HEALTH_URL: "http://127.0.0.1:3000/"
+
+    # Snyk settings
+    SNYK_SEVERITY_THRESHOLD: "high"   # low|medium|high|critical
+    SNYK_ENFORCE: "false"             # "true" to fail the build on Snyk threshold findings
+
+    # ZAP settings
+    ZAP_FAIL_LEVEL: "1"               # 0=pass, 1=warn on Medium+, etc. baseline uses -m <level>
+    ZAP_ENFORCE: "true"               # "true" to fail build if ZAP exit code is non-zero
+    ZAP_IMAGE: "ghcr.io/zaproxy/zaproxy:stable"
+
+phases:
+  install:
+    commands:
+      - echo "==> Installing base tools"
+      - apt-get update -y
+      - apt-get install -y curl jq
+
+  pre_build:
+    commands:
+      - echo "==> Installing Node deps"
+      - npm ci || npm install
+
+      - echo "==> Starting app in background"
+      - nohup sh -c "$APP_START_CMD" >/tmp/app.log 2>&1 &
+      - echo "==> Waiting for app to be healthy at $APP_HEALTH_URL"
+      - |
+        for i in $(seq 1 60); do
+          if curl -fsS "$APP_HEALTH_URL" >/dev/null 2>&1; then
+            echo "App is up."
+            break
+          fi
+          echo "Waiting for app... ($i/60)"
+          sleep 2
+        done
+      - curl -fsS "$APP_HEALTH_URL" >/dev/null 2>&1 || { echo "App did not become healthy in time"; exit 1; }
+
+  build:
+    commands:
+      - set -euo pipefail
+
+      # -------- SNYK SCA/SAST --------
+      - echo "==> Installing Snyk CLI"
+      - curl -sSL -o /usr/local/bin/snyk https://github.com/snyk/cli/releases/latest/download/snyk-linux
+      - chmod +x /usr/local/bin/snyk
+      - echo "==> Authenticating Snyk CLI"
+      - snyk auth "$SNYK_TOKEN"
+
+      - echo "==> Running Snyk test (threshold=$SNYK_SEVERITY_THRESHOLD, enforce=$SNYK_ENFORCE)"
+      - |
+        set +e
+        snyk test --severity-threshold="$SNYK_SEVERITY_THRESHOLD" --json-file-output=snyk_report.json
+        SNYK_EXIT=$?
+        set -e
+        if [ "$SNYK_ENFORCE" = "true" ] && [ $SNYK_EXIT -ne 0 ]; then
+          echo "Snyk found issues at/above threshold; failing build."
+          exit $SNYK_EXIT
+        else
+          echo "Snyk exit code: $SNYK_EXIT (enforce=$SNYK_ENFORCE)"
+        fi
+
+      # -------- OWASP ZAP DAST (Baseline) --------
+      - echo "==> Running OWASP ZAP Baseline scan against $APP_HEALTH_URL"
+      - |
+        # Requires CodeBuild 'Privileged' mode so Docker can run
+        docker run --rm --network host \
+          -v "$PWD":/zap/wrk/:rw \
+          "$ZAP_IMAGE" \
+          zap-baseline.py \
+            -t "$APP_HEALTH_URL" \
+            -r zap_report.html \
+            -w zap_warnings.md \
+            -x zap_report.xml \
+            -m "$ZAP_FAIL_LEVEL"
+        ZAP_EXIT=$? || true
+        echo "ZAP exit code: $ZAP_EXIT (enforce=$ZAP_ENFORCE)"
+        if [ "$ZAP_ENFORCE" = "true" ] && [ $ZAP_EXIT -ne 0 ]; then
+          echo "ZAP reported findings over the configured threshold; failing build."
+          exit $ZAP_EXIT
+        fi
+
+artifacts:
+  files:
+    - snyk_report.json
+    - zap_report.html
+    - zap_warnings.md
+    - zap_report.xml
+    - /tmp/app.log
+  discard-paths: yes
